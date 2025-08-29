@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Queue Producer
-Envía trabajos a las colas de RabbitMQ
+Queue Producer - SIMPLIFIED VERSION
+Envía trabajos a las colas de RabbitMQ sin declarar exchange en connect
 """
-
 import pika
 import json
 import uuid
 import logging
+import os
 from typing import Dict, Any, Optional
 from datetime import datetime
 
@@ -21,25 +21,82 @@ class QueueProducer:
         Args:
             rabbitmq_url: URL de conexión a RabbitMQ
         """
-        self.rabbitmq_url = rabbitmq_url or 'amqp://tutor_user:tutor_password@localhost:5672/tutor_ia'
+        # Usar variable de entorno o valor por defecto correcto
+        self.rabbitmq_url = rabbitmq_url or os.getenv(
+            'RABBITMQ_URL', 
+            'amqp://tutor_user:tutor_password@rabbitmq:5672/tutor_ia'
+        )
         self.connection = None
         self.channel = None
-    
+        logger.info(f"Configurando QueueProducer con URL: {self.rabbitmq_url}")
+        
     def connect(self):
-        """Establece conexión con RabbitMQ"""
+        """Establece conexión con RabbitMQ - VERSIÓN SIMPLIFICADA"""
         try:
+            logger.info("Intentando conectar a RabbitMQ...")
             parameters = pika.URLParameters(self.rabbitmq_url)
+            # Añadir timeout para evitar bloqueos
+            parameters.connection_attempts = 3
+            parameters.retry_delay = 2
+            
             self.connection = pika.BlockingConnection(parameters)
             self.channel = self.connection.channel()
+            
+            # NO declarar exchange aquí - solo establecer conexión
+            logger.info("✅ Conectado exitosamente a RabbitMQ")
             return True
+            
         except Exception as e:
             logger.error(f"Error conectando a RabbitMQ: {e}")
             return False
     
+    def ensure_exchange_and_queue(self):
+        """Asegura que el exchange y la cola existan - llamar solo cuando sea necesario"""
+        if not self.channel:
+            return False
+            
+        try:
+            # Declarar el exchange si no existe
+            self.channel.exchange_declare(
+                exchange='tutor.processing',
+                exchange_type='topic',
+                durable=True,
+                passive=False  # No fallar si no existe, crearlo
+            )
+            
+            # Declarar la cola
+            self.channel.queue_declare(
+                queue='pdf_processing',
+                durable=True,
+                arguments={
+                    'x-max-priority': 10
+                }
+            )
+            
+            # Bind de la cola al exchange
+            self.channel.queue_bind(
+                exchange='tutor.processing',
+                queue='pdf_processing',
+                routing_key='pdf.process'
+            )
+            
+            self.channel.queue_bind(
+                exchange='tutor.processing',
+                queue='pdf_processing',
+                routing_key='pdf.process.priority'
+            )
+            
+            logger.info("Exchange y cola configurados correctamente")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error configurando exchange/cola: {e}")
+            return False
+    
     def send_pdf_processing_job(
-        self, 
-        filename: str, 
-        file_path: str, 
+        self,
+        filename: str,
+        file_path: str,
         user_id: str,
         priority: bool = False,
         require_analysis: bool = True,
@@ -59,8 +116,11 @@ class QueueProducer:
         Returns:
             job_id del trabajo creado
         """
-        if not self.channel:
-            self.connect()
+        if not self.channel or not self.connection or self.connection.is_closed:
+            if not self.connect():
+                raise Exception("No se pudo conectar a RabbitMQ")
+            # Asegurar que el exchange y cola existan antes de enviar
+            self.ensure_exchange_and_queue()
         
         job_id = str(uuid.uuid4())
         
@@ -78,8 +138,10 @@ class QueueProducer:
         routing_key = 'pdf.process.priority' if priority else 'pdf.process'
         
         try:
+            # Si usamos el exchange default (vacío), no necesitamos routing key especial
+            # Pero si usamos un exchange custom, sí
             self.channel.basic_publish(
-                exchange='tutor.processing',
+                exchange='tutor.processing',  # Usar el exchange custom
                 routing_key=routing_key,
                 body=json.dumps(message),
                 properties=pika.BasicProperties(
@@ -94,82 +156,13 @@ class QueueProducer:
             
         except Exception as e:
             logger.error(f"❌ Error enviando job: {e}")
-            raise
-    
-    def send_notification(
-        self,
-        user_id: str,
-        notification_type: str,
-        content: Dict[str, Any]
-    ):
-        """
-        Envía una notificación a la cola
-        
-        Args:
-            user_id: ID del usuario
-            notification_type: Tipo de notificación (email, push, etc.)
-            content: Contenido de la notificación
-        """
-        if not self.channel:
-            self.connect()
-        
-        message = {
-            'notification_id': str(uuid.uuid4()),
-            'user_id': user_id,
-            'type': notification_type,
-            'content': content,
-            'created_at': datetime.utcnow().isoformat()
-        }
-        
-        try:
-            self.channel.basic_publish(
-                exchange='tutor.direct',
-                routing_key='notify',
-                body=json.dumps(message),
-                properties=pika.BasicProperties(
-                    delivery_mode=2,
-                    content_type='application/json'
-                )
-            )
-            
-            logger.info(f"📧 Notificación enviada: {message['notification_id']}")
-            
-        except Exception as e:
-            logger.error(f"❌ Error enviando notificación: {e}")
+            # Intentar reconectar para el próximo mensaje
+            self.connection = None
+            self.channel = None
             raise
     
     def close(self):
-        """Cierra la conexión"""
+        """Cierra la conexión con RabbitMQ"""
         if self.connection and not self.connection.is_closed:
             self.connection.close()
-
-# Ejemplo de uso
-if __name__ == "__main__":
-    producer = QueueProducer()
-    
-    # Enviar un trabajo de procesamiento
-    job_id = producer.send_pdf_processing_job(
-        filename="documento_ejemplo.pdf",
-        file_path="pdfs/user123/documento_ejemplo.pdf",
-        user_id="user123",
-        priority=False,
-        require_analysis=True,
-        metadata={
-            'pages': 10,
-            'size_mb': 2.5
-        }
-    )
-    
-    print(f"Job creado: {job_id}")
-    
-    # Enviar una notificación
-    producer.send_notification(
-        user_id="user123",
-        notification_type="email",
-        content={
-            'subject': 'PDF Procesado',
-            'body': f'Tu documento ha sido procesado exitosamente. Job ID: {job_id}'
-        }
-    )
-    
-    producer.close()
+            logger.info("Conexión a RabbitMQ cerrada")
